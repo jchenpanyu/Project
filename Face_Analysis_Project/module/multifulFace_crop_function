@@ -4,14 +4,11 @@
 Created on Sat Sep 30 13:45:50 2017
 @author: vincchen
 E-mail: vincentchan.sysu@gmail.com
-本函数用于把输入的图片(image)中，人脸部分提取出去，并把人脸的尺寸归一化到crop_size并分别保存出去
+本函数用于把输入的图片(image)中人脸部分提取出去，并把人脸的尺寸归一化到crop_size
 适用于image中有多张人脸的情况
 """
 
-import cv2
-import numpy as np
-
-def face_crop(image, crop_size):
+def multifulFace_crop(image, crop_size):
     # image为待处理的图片
     # crop_size为从image截取人脸(截取为正方形)后的缩放的尺寸，例如50
     
@@ -19,9 +16,11 @@ def face_crop(image, crop_size):
     classifier = cv2.CascadeClassifier(r'.\haarcascade_frontalface_default.xml')
     face = classifier.detectMultiScale(image, 1.2, 2, cv2.CASCADE_SCALE_IMAGE)
     # 判读是否有识别去人脸
-    # Yes -> 把所有的face image保存出去
+    # Yes -> 以list的形式返回所有的image
     # No -> 返回None
     if face != ():
+        face_n = face.shape[0]
+        face_list = [[]]*face_n # 保存所有的face
         for i, face_coordinate in enumerate(face):# 循环提取所有的人脸
             # x, y为人脸识别框的左上角坐标
             # w, h为人脸识别框的宽度，高度
@@ -39,8 +38,8 @@ def face_crop(image, crop_size):
             # 4) INTER_CUBIC - 基于4x4像素邻域的3次插值法
             # 5) INTER_LANCZOS4 - 基于8x8像素邻域的Lanczos插值
             ratio = float(crop_size)/L
-            cropface_image=cv2.resize(cropface_image, (0, 0), fx=ratio, fy=ratio, interpolation=cv2.INTER_NEAREST)
-            # 把提取的人脸分别保存成jpg文件
-            cv2.imwrite('face_'+ str(i) + '.jpg', cropface_image)
+            face_list[i] = cv2.resize(cropface_image, (0, 0), fx=ratio, fy=ratio, interpolation=cv2.INTER_NEAREST)
+            # cv2.imwrite('face_'+ str(i) + '.jpg', cropface_image)
+        return face_list
     else:
-        return False
+        return None
