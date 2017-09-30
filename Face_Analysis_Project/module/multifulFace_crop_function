@@ -8,6 +8,9 @@ E-mail: vincentchan.sysu@gmail.com
 适用于image中有多张人脸的情况
 """
 
+import cv2
+import numpy as np
+
 def multifulFace_crop(image, crop_size):
     # image为待处理的图片
     # crop_size为从image截取人脸(截取为正方形)后的缩放的尺寸，例如50
