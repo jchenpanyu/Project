@@ -42,7 +42,6 @@ def multifulFace_crop(image, crop_size):
             # 5) INTER_LANCZOS4 - 基于8x8像素邻域的Lanczos插值
             ratio = float(crop_size)/L
             face_list[i] = cv2.resize(cropface_image, (0, 0), fx=ratio, fy=ratio, interpolation=cv2.INTER_NEAREST)
-            # cv2.imwrite('face_'+ str(i) + '.jpg', cropface_image)
         return face_list
     else:
         return None
