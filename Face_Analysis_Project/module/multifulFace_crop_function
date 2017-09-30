@@ -5,6 +5,7 @@ Created on Sat Sep 30 13:45:50 2017
 @author: vincchen
 E-mail: vincentchan.sysu@gmail.com
 本函数用于把输入的图片(image)中人脸部分提取出去，并把人脸的尺寸归一化到crop_size
+以list的形式保存所有face的图片，并把list返回
 适用于image中有多张人脸的情况
 """
 
@@ -19,8 +20,8 @@ def multifulFace_crop(image, crop_size):
     classifier = cv2.CascadeClassifier(r'.\haarcascade_frontalface_default.xml')
     face = classifier.detectMultiScale(image, 1.2, 2, cv2.CASCADE_SCALE_IMAGE)
     # 判读是否有识别去人脸
-    # Yes -> 以list的形式返回所有的image
-    # No -> 返回None
+    # Yes   -> 以list的形式返回所有的face image
+    # No    -> 返回None
     if face != ():
         face_n = face.shape[0]
         face_list = [[]]*face_n # 保存所有的face
