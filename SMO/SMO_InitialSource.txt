@@ -1,1 +1,0 @@
-* train SMO initial source
