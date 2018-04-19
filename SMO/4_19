@@ -1,0 +1,785 @@
+#!/usr/bin/python
+# -*- coding: UTF-8 -*-
+
+"""
+Newron-SRAF PGM pattern selection
+@time: 2018/3/3
+author: vincent.chen
+contact: vincentchan.sysu@gmail.com
+
+2018-03-05:
+    1 加入K-means代码cluster切割后的clip，K值设定的原理为：num_col + num_row, 保证每一列跟每一行都有一个cluster
+    2 给PGM5toARRAY加一个参数控制要不要做归一化处理
+    3 加入代码从每个cluster中去pick up AUTO_SELECTION_PERCENT的pattern
+    4 加入卷积代码
+    5 对每个cluster下的image做卷积desample(200*200 -> 20*20), 然后计算同一个cluster下不同image同一个空间位置的标准差，最后把所有像素点的std求和来衡量一个cluster下图像的variance，这个variance越大，代表一个cluster下不同image之间的差异越大，反之差异越少 --> 可以用来指导取样的数目
+2018-03-06:
+    6 把crop size从200pixel扩大到400pixel
+    7 保存每个cluster跟auto-pickup后的image
+    8 把每个cluster的std保存到相应的List里，n_sample x 1
+    9 每一个cluster的随机取样比例跟该cluster的std相关，std越大，比例越大
+    10 直接读取的PGM显示是上下颠倒的，用array=array[::-1]翻转回去
+    11 在full-GDS上把把selected cell的轮廓画出来
+    12 用200crop size pick出来的有更好的coverage，改回200
+    13 基于std pickup的比例调低
+2018-03-07:
+    14 处理坐标问题，use指定input PGM的坐标，可以返回crop PGM的坐标
+    15 做一个特别的例子， 先备注了，结果表明不太好
+2018-03-08:
+    16 输出每个cell的坐标
+    17 写了计算每个图片之间的standard deviation的函数
+    18 把分拆后的cell_lib里面每一张image去计算两两之间std
+2018-03-09:
+    19 test了一下image-image之间的std，不太work
+2018-03-12:
+    20 重写一下代码，clean一下
+2018-03-13:
+    21 重写一下代码，clean一下，成功clean了代码
+2018-03-14:
+    22 把全PGM分割小块后，先基于std去filter out重复的clip，再继续后kmeans
+    23 可视化根据面积归类的每个类别
+    24 根据std=0.12去判断重复，实现了filter out，remove的cell index放在remove_cell_index
+2018-03-15:
+    25 在filter out了repeat cell后挑选training set
+    26 尝试输出坐标
+    27 绝对坐标错了
+    28 需要再次clean代码，优化流程
+2018-03-16:
+    26 Use larger cell_w, cell_h
+    27 Correctly convert selection-clip coordinate to mask setup in SMO
+"""
+
+import numpy as np
+from PIL import Image
+from sklearn.cluster import KMeans
+from scipy import signal
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from sklearn import metrics
+from sklearn.decomposition import PCA 
+
+
+"""
+定义初始化变量
+"""
+# PGM size:
+# 6180x6180 pixel (14nm pixel size), 包括Cell Window外约为3.2um的外扩boundary，此boundary需要剔除
+# 剔除boundary后约为 80x80 um^2 --> ~5700x5700 pixel
+DEFAULT_IMAGE = r"C:\Users\vincchen\Documents\1_Assignment\195-Newron-SRAF_InnotronPClayer\report\Material\c0displaymi_1001_2.pgm"
+
+PIXEL_SIZE = 0.020 # 20nm的pixel size
+ELIMINATED_MARGIN = int(np.ceil(3.2/PIXEL_SIZE)) # margin的物理距离约为3.2um，转化为pixel数目
+CELL_H = 200 # cropped cell height
+CELL_W = 200 # cropped cell width
+
+Y_0 = -5316  # 整张PGM左上角的Y坐标，单位um
+X_0 = 182  # 整张PGM左上角的X坐标，单位um
+INITIAL_COORDINATE= (Y_0, X_0) # 整张GDS左上角的坐标，单位um
+
+# downsample用的平均filter
+CONVOLUTION_FILTER_SIZE = 10
+CONVOLUTION_FILTER = np.ones((CONVOLUTION_FILTER_SIZE, CONVOLUTION_FILTER_SIZE))/np.power(CONVOLUTION_FILTER_SIZE, 2)
+
+
+"""
+定义函数
+"""
+# 把PGM转为array，并且默认做了归一化到[0, 1]范围的归一化处理
+def PGM5toARRAY(input_pgm, normalization=True):
+    pgm_image = Image.open(input_pgm) # 读取PGM
+    pgm_array = np.array(pgm_image, np.float32) # convert pgm to array
+    pgm_array = pgm_array[::-1] # 读入的pgm上下是颠倒的，所以反序一下
+    if normalization:
+        pgm_array = (pgm_array - pgm_array.min()) / (pgm_array.max() - pgm_array.min()) # 归一化到0-1
+    return pgm_array
+
+# 把一张完整的PGM，剔除四周的margin（ELIMINATED_MARGIN）
+# 然后基于CELL_H， CELL_W的大小，基于剩余的PGM计算能crop出来的行列数目
+# 最后输出每一个crop出的cell，对应的行列index，已经左上角坐标
+def crop_array(input_array, input_array_coordinate, cell_h, cell_w):
+    input_array_H, input_array_W = input_array.shape
+    if (input_array_H >= cell_h + 2*ELIMINATED_MARGIN) and (input_array_W >= cell_w + 2*ELIMINATED_MARGIN):        
+        crop_h = input_array_H - 2*ELIMINATED_MARGIN
+        crop_w = input_array_W - 2*ELIMINATED_MARGIN
+        num_cell_row = np.int8(np.floor(crop_h / cell_h))
+        num_cell_col = np.int8(np.floor(crop_w / cell_w))
+        crop_array = input_array[ELIMINATED_MARGIN : ELIMINATED_MARGIN + cell_h * num_cell_row,
+                                 ELIMINATED_MARGIN : ELIMINATED_MARGIN + cell_w * num_cell_col]
+        crop_y0 = input_array_coordinate[0] - ELIMINATED_MARGIN*PIXEL_SIZE # 纵坐标往下走是减少的
+        crop_x0 = input_array_coordinate[1] + ELIMINATED_MARGIN*PIXEL_SIZE # 横坐标往右走是增加的
+        crop_array_shape = (num_cell_row, num_cell_col)
+        crop_array_coordinate = (crop_y0, crop_x0)
+        return crop_array, crop_array_shape, crop_array_coordinate
+    else:
+        print "Faile to crop input_array as its size is too small"
+
+# 把一张PGM按大小为（cell_H， cell_W）去切割成crop_array_shape的小clip
+def cellLibrary(input_array, input_array_coordinate, cell_H, cell_W, cell_num_row, cell_num_col):
+    cell_index = np.arange(int(cell_num_row) * int(cell_num_col)) # 生成每个cell的index 
+    cell_image = None # 每一列保存一个cell flatten后的image  
+    cell_position = [] # 保存每一个cell的row, colunm index
+    cell_coordinate = [] # 每个clip的左上角坐标保存到cell_coordinate这个list里面
+    cell_row_index = np.arange(cell_num_row)
+    cell_col_index = np.arange(cell_num_col)
+    # 按从左到右，从上到下crop出image并flatten后append到cell_image这个list里面
+    # 把每个clip对于的row, colunm index保存到cell_index这个list里面
+    # 把每个clip的左上角坐标保存到cell_coordinate这个list里面
+    for row in cell_row_index:
+        for col in cell_col_index:
+            append_array = input_array[row*cell_H : (row+1)*cell_H, 
+                                      col*cell_W : (col+1)*cell_W].flatten()
+            if cell_image is None:
+                cell_image = append_array
+            else:
+                cell_image = np.row_stack((cell_image, append_array))
+            cell_position.append([row, col]) 
+            cell_coordinate.append((input_array_coordinate[0] - row*cell_H*PIXEL_SIZE,
+                                    input_array_coordinate[1] + col*cell_W*PIXEL_SIZE))
+    cell_position = np.array(cell_position)
+    cell_coordinate = np.array(cell_coordinate)
+    return cell_index, cell_image, cell_position, cell_coordinate
+
+# 用一个平均数filter去卷积image
+def convolveImgage(input_array, convolve_filter=CONVOLUTION_FILTER):
+    convolve_array = signal.fftconvolve(input_array, CONVOLUTION_FILTER, mode='same')
+    return convolve_array
+
+# 输入的img是2D的，flatten后计算两个flatten images之间的std
+def stdBetweenImage(array_1, array_2):
+    if array_1.shape == array_2.shape:              
+        array_1_flatten = array_1.flatten()
+        array_2_flatten = array_2.flatten()
+        num_pixel = len(array_1_flatten)
+        std_perPixel = np.std(np.vstack((array_1_flatten, array_2_flatten)), axis=0)
+        std_sumPixel = np.sum(std_perPixel)
+        std_avePixel = std_sumPixel / num_pixel
+        return std_perPixel.reshape(array_1.shape), std_sumPixel, std_avePixel
+    else:
+        print("Fail: img_1 shape is different from img_2 shape")
+ 
+# 计算每个cluster下的所有图片的standard deviation
+def stdImage(cluster_array):
+    num_sample = cluster_array.shape[0]
+    sub_image = np.zeros((num_sample, CELL_H*CELL_W))
+    for n in np.arange(num_sample):
+        sub_image[n, :] = convolveImgage(cluster_array[n].reshape((CELL_H, CELL_W))).flatten()  
+    cluster_std = np.sum(np.std(sub_image, axis=0)) / (CELL_H*CELL_W)
+    return cluster_std
+       
+"""
+定义main flow
+"""
+# 读取并生成test dataset
+# 读取全PGM
+test_array = PGM5toARRAY(DEFAULT_IMAGE, normalization=True)
+# crop PGM
+test_crop_array, test_crop_array_shape, test_crop_coordinate = crop_array(input_array = test_array,
+                                                                          input_array_coordinate = INITIAL_COORDINATE,
+                                                                          cell_h = CELL_H, cell_w = CELL_W)
+# 切割成cells
+cell_data = cellLibrary(test_crop_array, input_array_coordinate = test_crop_coordinate,
+                          cell_H = CELL_H, cell_W = CELL_W,
+                          cell_num_row = test_crop_array_shape[0], cell_num_col = test_crop_array_shape[1])
+cell_index = cell_data[0]       # 每个cell的编号
+cell_lib = cell_data[1]         # 每个cell flatten后的image
+cell_position = cell_data[2]    # 每个cell的row column数
+cell_coordinate  = cell_data[3] # 每个cell的左上角y，x坐标
+cell_num = len(cell_index)      # cell的数目
+cell_num_row = int(test_crop_array_shape[0]) # cell的行数
+cell_num_col = int(test_crop_array_shape[1]) # cell的列数
+
+
+def fft_image(input_img):
+    img = input_img.reshape((CELL_H, CELL_H))
+    temp_img_fft = np.fft.fft2(img)
+    #temp_img_fft = np.fft.fftshift(temp_img_fft)
+    temp_img_fft = np.log(np.abs(temp_img_fft) + np.power(10.0, -9))
+    temp_img_fft = temp_img_fft.flatten()
+    return temp_img_fft
+
+cell_lib_fft = np.zeros(cell_lib.shape)
+for i in range(cell_lib_fft.shape[0]):
+    cell_lib_fft[i, :] = fft_image(cell_lib[i, :])
+    
+
+# determine K
+cell_var = np.var(cell_lib, axis=1) # 每个cell的面积
+# 根据所以cell面积的max，min，std分区去设定分类的数目
+max_cell_var = cell_var.max()
+min_cell_var = cell_var.min()
+std_cell_var = np.std(cell_var)
+numClass_cell_var = int(np.ceil((max_cell_var - min_cell_var) / std_cell_var))
+
+
+# cluster in Frequency-domain
+print "Start cluster in Frequency-domain"
+number_clusters = numClass_cell_var # kmean cluster的数目就暂时跟面积分类相关 
+km_fft = KMeans(n_clusters=number_clusters, init='k-means++', n_init=20, max_iter=3000000, tol=1e-06, random_state=0)
+cell_km_fft = km_fft.fit_predict(cell_lib_fft)
+cell_km_fft_index = []
+for i in np.arange(number_clusters):
+    temp_index = np.where(cell_km_fft==i)[0]
+    cell_km_fft_index.append(temp_index)
+print "Done\n"
+
+N=0
+# cluster each FFT_cluster in Space-domain
+print "Start cluster in Space-domain"
+cell_km_fft_space_index = []
+for i, fft_cluster_index in enumerate(cell_km_fft_index):
+    print i, len(fft_cluster_index)
+    fft_cluster_cell = cell_lib[fft_cluster_index]
+    fft_cluster_cell_var = np.var(fft_cluster_cell, axis=1)  
+    K_space = int(np.ceil((fft_cluster_cell_var.max() - fft_cluster_cell_var.min()) / np.std(fft_cluster_cell_var)))
+    print K_space
+    km_space = KMeans(n_clusters=K_space, init='k-means++', n_init=20, max_iter=3000000, tol=1e-06, random_state=0)
+    cell_km_fft_space = km_space.fit_predict(fft_cluster_cell)
+    temp_cell_km_fft_space_index = []
+    for j in np.arange(K_space):
+        temp_index = np.where(cell_km_fft_space==j)[0]
+        append_index = fft_cluster_index[temp_index]
+        temp_cell_km_fft_space_index.append(append_index)
+    print len(temp_index)
+    cell_km_fft_space_index.append(temp_cell_km_fft_space_index)
+    print ""
+    
+    
+    
+
+fig_1 = plt.figure()
+plt.title("af cell_lib")
+ax_1 = fig_1.add_subplot(111)
+ax_1.imshow(test_crop_array, cmap='gray') # 先画上full GDS image
+fig_1.tight_layout()
+ax_1.axis('off')
+colormap = ['r', 'g', 'b', 'w', 'cyan', 'deeppink', 'gainsboro', 'olive']
+for i in np.arange(number_clusters):
+    temp_index = cell_km_fft_index[i]    
+    for j in temp_index:
+        temp_position = cell_position[j]    
+        x = CELL_W*temp_position[1] # rectangle左上角坐标
+        y = CELL_H*temp_position[0] # rectangle左上角坐标
+        ax_1.add_patch(patches.Rectangle((x, y), CELL_W-5, CELL_H-5, linewidth=2, edgecolor=colormap[i], facecolor='none'))
+
+
+for i in np.arange(number_clusters):
+    cluster_index = cell_km_fft_space_index[i]
+    n_cluster = len(cluster_index)
+    for j in range(n_cluster):
+        text_index = cluster_index[j]
+        for plot_index in text_index:
+            temp_position = cell_position[plot_index]
+            x = CELL_W*temp_position[1] # rectangle左上角坐标
+            y = CELL_H*temp_position[0] # rectangle左上角坐标
+            text = str(i)+"_"+str(j)
+            ax_1.text(x+20, y+CELL_H/2, text, fontsize=15, bbox=dict(facecolor=colormap[i], alpha=0.5))
+            print text
+
+
+
+
+
+
+test_index = cell_km_fft_space_index[1][1]
+test_cell_lib = cell_lib[test_index]
+
+
+from sklearn.cluster import AffinityPropagation
+af = AffinityPropagation(max_iter=20000,preference=-1000).fit(test_cell_lib)
+cluster_centers_indices = af.cluster_centers_indices_
+labels = af.labels_
+n_clusters_ = len(cluster_centers_indices)
+print n_clusters_
+
+
+fig=plt.figure()
+for i in range(test_cell_lib.shape[0]):
+    ax = fig.add_subplot(8, 8, i+1)
+    ax.axis('off')
+    ax.imshow(test_cell_lib[i].reshape((CELL_H, CELL_W)), cmap='gray')
+
+
+fig=plt.figure()
+for i,index in enumerate(cluster_centers_indices):
+    print index
+    ax = fig.add_subplot(8, 8, i+1)
+    ax.axis('off')
+    ax.imshow(test_cell_lib[index].reshape((CELL_H, CELL_W)), cmap='gray')
+    
+
+
+
+
+
+"""
+
+
+from sklearn.cluster import AffinityPropagation
+af = AffinityPropagation(affinity="euclidean", max_iter=20000).fit(cell_lib_fft)
+cluster_centers_indices = af.cluster_centers_indices_
+labels = af.labels_
+n_clusters_ = len(cluster_centers_indices)
+n_clusters_
+
+# 把每个kmeans cluster后的cell可视化
+fig_1 = plt.figure()
+plt.title("af cell_lib")
+ax_1 = fig_1.add_subplot(111)
+ax_1.imshow(test_crop_array, cmap='gray') # 先画上full GDS image
+fig_1.tight_layout()
+ax_1.axis('off')
+plt.hlines(np.arange(0, cell_num_row*CELL_H, CELL_H), 0, cell_num_col*CELL_W, linestyles='--', colors='blue') 
+plt.vlines(np.arange(0, cell_num_col*CELL_W, CELL_W), 0, cell_num_row*CELL_H, linestyles='--', colors='blue')
+for i in np.arange(n_clusters_):
+    temp_index = np.where(labels==i)[0]
+    for j in temp_index:
+        temp_position = cell_position[j]    
+        x = CELL_W*temp_position[1] # rectangle左上角坐标
+        y = CELL_H*temp_position[0] # rectangle左上角坐标
+        ax_1.text(x+20, y+CELL_H/2, str(i), fontsize=15, bbox=dict(facecolor='red', alpha=0.5))
+
+
+
+
+
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import DBSCAN
+cell_lib_scale = StandardScaler().fit_transform(cell_lib)
+db = DBSCAN(min_samples=10).fit(cell_lib_scale)
+labels = db.labels_
+n_clusters_ = len(set(labels)) - (1 if -1 in labels else 0)
+labels
+n_clusters_
+
+
+
+
+# PCA
+pca_sk = PCA(n_components=50)  
+cell_lib_pca = pca_sk.fit_transform(cell_lib)
+
+
+
+# 用kmeans方法去cluster remain的cell image
+number_clusters = 3 # kmean cluster的数目就暂时跟面积分类相关 
+# 定义means方法
+km = KMeans(n_clusters=number_clusters,
+            init='k-means++',
+            n_init=1000,
+            max_iter=3000000,
+            tol=1e-06,
+            random_state=0)
+# 用Kmeans去cluster remain image
+cell_km     = km.fit_predict(cell_lib)
+cell_km_fft = km.fit_predict(cell_lib_fft)
+cell_km_pca = km.fit_predict(cell_lib_pca)
+
+
+# 把每个kmeans cluster后的cell可视化
+fig_1 = plt.figure()
+plt.title("cell_km")
+ax_1 = fig_1.add_subplot(111)
+ax_1.imshow(test_crop_array, cmap='gray') # 先画上full GDS image
+fig_1.tight_layout()
+ax_1.axis('off')
+colormap = ['r', 'g', 'b', 'w', 'cyan', 'deeppink', 'gainsboro', 'olive']
+for i in np.arange(number_clusters):
+    temp_index = np.where(cell_km==i)[0]
+    for j in temp_index:
+        temp_position = cell_position[j]    
+        x = CELL_W*temp_position[1] # rectangle左上角坐标
+        y = CELL_H*temp_position[0] # rectangle左上角坐标
+        ax_1.add_patch(patches.Rectangle((x, y), CELL_W-5, CELL_H-5, linewidth=2, edgecolor=colormap[i], facecolor='none'))
+
+
+# 把每个kmeans cluster后的cell可视化
+fig_1 = plt.figure()
+plt.title("cell_km_fft")
+ax_1 = fig_1.add_subplot(111)
+ax_1.imshow(test_crop_array, cmap='gray') # 先画上full GDS image
+fig_1.tight_layout()
+ax_1.axis('off')
+colormap = ['r', 'g', 'b', 'w', 'cyan', 'deeppink', 'gainsboro', 'olive']
+for i in np.arange(number_clusters):
+    temp_index = np.where(cell_km_fft==i)[0]
+    for j in temp_index:
+        temp_position = cell_position[j]    
+        x = CELL_W*temp_position[1] # rectangle左上角坐标
+        y = CELL_H*temp_position[0] # rectangle左上角坐标
+        ax_1.add_patch(patches.Rectangle((x, y), CELL_W-5, CELL_H-5, linewidth=2, edgecolor=colormap[i], facecolor='none'))
+        
+        
+        
+# 把每个kmeans cluster后的cell可视化
+fig_1 = plt.figure()
+plt.title("cell_km_pca")
+ax_1 = fig_1.add_subplot(111)
+ax_1.imshow(test_crop_array, cmap='gray') # 先画上full GDS image
+fig_1.tight_layout()
+ax_1.axis('off')
+colormap = ['r', 'g', 'b', 'w', 'cyan', 'deeppink', 'gainsboro', 'olive']
+for i in np.arange(number_clusters):
+    temp_index = np.where(cell_km_pca==i)[0]
+    for j in temp_index:
+        temp_position = cell_position[j]    
+        x = CELL_W*temp_position[1] # rectangle左上角坐标
+        y = CELL_H*temp_position[0] # rectangle左上角坐标
+        ax_1.add_patch(patches.Rectangle((x, y), CELL_W-5, CELL_H-5, linewidth=2, edgecolor=colormap[i], facecolor='none'))
+
+
+
+fig_1 = plt.figure()
+for i in range(cell_lib_fft.shape[0]):
+    ax = fig_1.add_subplot(cell_num_row, cell_num_col, i+1)
+    ax.axis('off')
+    ax.imshow(cell_lib_fft[i].reshape((CELL_H, CELL_W)), cmap='gray')
+
+
+
+seed_index = [21, 22, 41]
+
+fig_1 = plt.figure()
+for i in range(len(seed_index)):
+    plot_index = seed_index[i]
+    ax = fig_1.add_subplot(2, 2, i+1)
+    ax.axis('off')
+    ax.imshow(cell_lib[plot_index].reshape((CELL_H, CELL_W)), cmap='gray')
+
+seed_cell = cell_lib_fft[seed_index]
+number_clusters = 3
+km = KMeans(n_clusters=number_clusters,
+            init=seed_cell,
+            max_iter=3000000,
+            n_init=1,
+            tol=1e-06,
+            random_state=0)
+# 用Kmeans去cluster remain image
+cell_km_fft = km.fit_predict(cell_lib_fft)
+fig_1 = plt.figure()
+plt.title("cell_km_fft")
+ax_1 = fig_1.add_subplot(111)
+ax_1.imshow(test_crop_array, cmap='gray') # 先画上full GDS image
+fig_1.tight_layout()
+ax_1.axis('off')
+colormap = ['r', 'g', 'b', 'w', 'cyan', 'deeppink', 'gainsboro', 'olive']
+for i in np.arange(number_clusters):
+    temp_index = np.where(cell_km_fft==i)[0]
+    for j in temp_index:
+        temp_position = cell_position[j]    
+        x = CELL_W*temp_position[1] # rectangle左上角坐标
+        y = CELL_H*temp_position[0] # rectangle左上角坐标
+        ax_1.add_patch(patches.Rectangle((x, y), CELL_W-5, CELL_H-5, linewidth=2, edgecolor=colormap[i], facecolor='none'))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+for i in np.arange(number_clusters):
+    temp_index = np.where(cell_km_fft==i)[0]
+    fig = plt.figure()
+    for j, index in enumerate(temp_index):
+        if j > 99:
+            continue
+        ax = fig.add_subplot(10, 10, j+1)
+        ax.axis('off')
+        ax.imshow(cell_lib[index].reshape((CELL_H, CELL_W)), cmap='gray')
+
+
+
+temp_index = np.where(cell_km_fft==2)[0]
+cell_lib_withFFT2     = cell_lib[temp_index]
+cell_lib_withFFT2_fft = cell_lib_fft[temp_index]
+
+number_clusters = 2 # kmean cluster的数目就暂时跟面积分类相关 
+# 定义means方法
+km = KMeans(n_clusters=number_clusters,
+            init='k-means++',
+            n_init=100,
+            max_iter=3000000,
+            tol=1e-06,
+            random_state=0)
+
+cell_lib_withFFT2_fft_km_fft = km.fit_predict(cell_lib_withFFT2_fft)
+for i in np.arange(number_clusters):
+    temp_index = np.where(cell_lib_withFFT2_fft_km_fft==i)[0]
+    fig = plt.figure()
+    for j, index in enumerate(temp_index):
+        if j > 99:
+            continue
+        ax = fig.add_subplot(10, 10, j+1)
+        ax.axis('off')
+        ax.imshow(cell_lib[index].reshape((CELL_H, CELL_W)), cmap='gray')
+
+
+
+
+
+
+
+
+
+
+
+
+
+# 计算每个cell的面积然后分类，继而对每个类里的cell基于std差去重
+cell_area = np.sum(cell_lib, axis=1) # 每个cell的面积
+# 根据所以cell面积的max，min，std分区去设定分类的数目
+max_cell_area = cell_area.max()
+min_cell_area = cell_area.min()
+std_cell_area = np.std(cell_area)
+# 分割的区间大小约为一般std
+gap_cell_area = np.std(cell_area)
+# 根据面积分类的类数目：
+numClass_cell_area = int(np.ceil((max_cell_area - min_cell_area) / gap_cell_area))
+class_cell_area = [] #用以保存同一个area类的index
+for n in np.arange(numClass_cell_area):
+    Low_boundary_set = set(np.where(cell_area >= (min_cell_area + n *     gap_cell_area))[0]) # 大于下限的集合
+    Up_boundary_set  = set(np.where(cell_area <  (min_cell_area + (n+1) * gap_cell_area))[0]) # 小于上限的集合
+    L_U_intersectionSet = list(Low_boundary_set.intersection(Up_boundary_set)) # 上下限的交集
+    L_U_intersectionSet.sort() # 排序好
+    class_cell_area.append(L_U_intersectionSet) # 把每个类的坐标放入class_cell_area
+class_cell_area = np.array(class_cell_area) # 把class_cell_area转成成array
+
+
+for i, index in enumerate(class_cell_area):
+    fig = plt.figure()
+    if len(index) > 49:
+        plot_index = np.random.choice(index, 49, replace=False)
+    else:
+        plot_index = index
+    for i, index in enumerate(plot_index):
+        ax = fig.add_subplot(7, 7, i+1)
+        ax.axis('off')
+        ax.imshow(cell_lib[index].reshape((CELL_H, CELL_W)), cmap='gray')    
+
+
+
+# 计算每个cell的面积然后分类，继而对每个类里的cell基于std差去重
+cell_var = np.var(cell_lib, axis=1) # 每个cell的面积
+# 根据所以cell面积的max，min，std分区去设定分类的数目
+max_cell_var = cell_var.max()
+min_cell_var = cell_var.min()
+std_cell_var = np.std(cell_var)
+# 分割的区间大小约为一般std
+gap_cell_var = np.std(cell_var)
+# 根据面积分类的类数目：
+numClass_cell_var = int(np.ceil((max_cell_var - min_cell_var) / gap_cell_var))
+class_cell_var = [] #用以保存同一个area类的index
+for n in np.arange(numClass_cell_area):
+    Low_boundary_set = set(np.where(cell_var >= (min_cell_var + n *     gap_cell_var))[0]) # 大于下限的集合
+    Up_boundary_set  = set(np.where(cell_var <  (min_cell_var + (n+1) * gap_cell_var))[0]) # 小于上限的集合
+    L_U_intersectionSet = list(Low_boundary_set.intersection(Up_boundary_set)) # 上下限的交集
+    L_U_intersectionSet.sort() # 排序好
+    class_cell_var.append(L_U_intersectionSet) # 把每个类的坐标放入class_cell_area
+class_cell_var = np.array(class_cell_var) # 把class_cell_area转成成array
+
+fig_1 = plt.figure()
+ax_1 = fig_1.add_subplot(111)
+ax_1.imshow(test_crop_array, cmap='gray') # 先画上full GDS image
+fig_1.tight_layout()
+ax_1.axis('off')
+colormap = ['r', 'g', 'b', 'w', 'cyan', 'deeppink', 'gainsboro', 'olive']
+for i, index in enumerate(class_cell_area):
+    temp_index = index
+    for j in temp_index:
+        temp_position = cell_position[j]    
+        x = CELL_W*temp_position[1] # rectangle左上角坐标
+        y = CELL_H*temp_position[0] # rectangle左上角坐标
+        ax_1.add_patch(patches.Rectangle((x, y), CELL_W-5, CELL_H-5, linewidth=2, edgecolor=colormap[i], facecolor='none'))
+fig_1.savefig("FullPGM_with_clusterCell.png", dpi=300) 
+
+
+
+
+
+
+
+# 针对每个area的类别，把里面卷积后std相差小于std_diff的去除
+std_diff = 0
+remove_cell_index = [] # 用以保存被去除的cell的index
+for n in np.arange(numClass_cell_area): #第一次循环，每个area class查找一次
+    for m in np.arange(len(class_cell_area[n])): # 当前area class下的cell的数目：len(class_cell_area[n])
+        # 用以被比较的cell是该类下的第m个，这是由于m-1个已经在m-1次循环的时候被比较一次了，不需要多次比较
+        # 卷积后再比较
+        toBeMatch_cell = convolveImgage(cell_lib[class_cell_area[n][m]].reshape((CELL_H, CELL_W)))
+        for i in np.arange(m+1, len(class_cell_area[n])):  # 用toBeMatch_cell的后一个sample开始找cell去比较
+            Match_cell = convolveImgage(cell_lib[class_cell_area[n][i]].reshape((CELL_H, CELL_W)))
+            std_between = stdBetweenImage(toBeMatch_cell, Match_cell)
+            print n, m, i, std_between[2] # 打印输出std
+            if std_between[2] < std_diff: # 如果std小于临界值，remove
+                remove_cell_index.append(class_cell_area[n][i])
+                print 'remove', class_cell_area[n][i]
+remove_cell_index = list(set(remove_cell_index)) #去掉重复的
+# 删除remove_cell_index
+remain_cell_index = list(cell_index)
+for n in remove_cell_index:
+    remain_cell_index.remove(n)
+remain_cell_index = np.array(remain_cell_index)
+
+# 将剩余的cell标记在full PGM上
+fig_1 = plt.figure()
+ax_1 = fig_1.add_subplot(111)
+ax_1.imshow(test_crop_array, cmap='gray') # 先画上full GDS image
+fig_1.tight_layout()
+ax_1.axis('off')
+for i in remain_cell_index:
+    position = cell_position[i]   
+    x = CELL_W*position[1] # rectangle左上角坐标
+    y = CELL_H*position[0] # rectangle左上角坐标
+    ax_1.add_patch(patches.Rectangle((x, y), CELL_W-5, CELL_H-5, linewidth=1, edgecolor='r', facecolor='none'))
+fig_1.savefig("FullPGM_with_remainCell.png", dpi=300)   
+
+    
+#  重新分配remain的cell
+cell_index_remain = np.arange(len(remain_cell_index))
+cell_lib_remain = cell_lib[remain_cell_index]
+cell_position_remain = cell_position[remain_cell_index]
+cell_coordinate_remain = cell_coordinate[remain_cell_index] #
+cell_num_remain = len(cell_index_remain)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# PCA
+pca_sk = PCA(n_components=50)  
+cell_lib_pca = pca_sk.fit_transform(cell_lib)
+
+
+# 用kmeans方法去cluster remain的cell image
+number_clusters = 4 # kmean cluster的数目就暂时跟面积分类相关 
+# 定义means方法
+km = KMeans(n_clusters=number_clusters,
+            init='k-means++',
+            n_init=100,
+            max_iter=3000000,
+            tol=1e-06,
+            random_state=0)
+# 用Kmeans去cluster remain image
+cell_km = km.fit_predict(cell_lib_pca)
+cell_km = km.fit_predict(cell_lib)
+
+# 把每个kmeans cluster后的cell可视化
+fig_1 = plt.figure()
+ax_1 = fig_1.add_subplot(111)
+ax_1.imshow(test_crop_array, cmap='gray') # 先画上full GDS image
+fig_1.tight_layout()
+ax_1.axis('off')
+colormap = ['r', 'g', 'b', 'w', 'cyan', 'deeppink', 'gainsboro', 'olive']
+for i in np.arange(number_clusters):
+    temp_index = np.where(cell_km==i)[0]
+    for j in temp_index:
+        temp_position = cell_position[j]    
+        x = CELL_W*temp_position[1] # rectangle左上角坐标
+        y = CELL_H*temp_position[0] # rectangle左上角坐标
+        ax_1.add_patch(patches.Rectangle((x, y), CELL_W-5, CELL_H-5, linewidth=2, edgecolor=colormap[i], facecolor='none'))
+fig_1.savefig("FullPGM_with_clusterCell.png", dpi=300) 
+
+3-15改动到这里为止，后续代码可以继续提炼修改
+
+
+
+# 计算每个remain cell cluster的std
+cluster_std = [] # 保存每个cluster的std
+for i in np.arange(number_clusters):
+    cluster_position = np.where(cell_km==i)[0] # 提取cluster label=i的index position
+    sub_cluster = cell_lib_remain[cluster_position] # 提取上述index的cell
+    cluster_std.append(stdImage(sub_cluster)) # 用一个list保存所有cluster的std
+    print i, len(np.where(cell_km==i)[0]), stdImage(sub_cluster) # 打印每个cluster的样品数目及std
+cluster_std_array = np.array(cluster_std) # convert to array
+re_cluster_std_array = (cluster_std_array - cluster_std_array.min()) / (cluster_std_array.max() - cluster_std_array.min())
+cluster_pickup_percent = (re_cluster_std_array + 0.05) * 0.1
+
+# 自动挑选training dataset:
+auto_selection_set = []
+auto_selection_set_label = []
+for cluster_label in np.arange(number_clusters):
+    sub_cluster_index = np.where(cell_km==cluster_label)[0]
+    numSample = len(sub_cluster_index)
+    cluster_percent = cluster_pickup_percent[cluster_label]
+    sub_cluster_num = int(np.ceil(cluster_percent*numSample))
+    randomSel_sub_cluster_index = np.random.choice(sub_cluster_index, sub_cluster_num, replace=False)
+    auto_selection_set.extend(randomSel_sub_cluster_index)
+    auto_selection_set_label.extend([cluster_label]*sub_cluster_num)
+
+# 自动挑选training dataset: randomly pick up AUTO_SELECTION_PERCENT pattern-sets from each clusters
+auto_selection_set = []
+auto_selection_set_label = []
+for cluster_label in np.arange(number_clusters):
+    sub_cluster_index = np.where(cell_km==cluster_label)[0]
+    numSample = len(sub_cluster_index)
+    cluster_percent = cluster_pickup_percent[cluster_label]
+    sub_cluster_num = int(np.ceil(cluster_percent*numSample))
+    randomSel_sub_cluster_index = np.random.choice(sub_cluster_index, sub_cluster_num, replace=False)
+    auto_selection_set.extend(randomSel_sub_cluster_index)
+    auto_selection_set_label.extend([cluster_label]*sub_cluster_num)
+
+# plot the auto selection set in the full-GDS:
+fig_4 = plt.figure()
+ax_4 = fig_4.add_subplot(111)
+ax_4.imshow(test_crop_array, cmap='gray') # 先画上full GDS image
+# 画上切割线
+plt.hlines(np.arange(0, cell_num_row*CELL_H, CELL_H), 0, cell_num_col*CELL_W, linestyles='--', colors='blue') 
+plt.vlines(np.arange(0, cell_num_col*CELL_W, CELL_W), 0, cell_num_row*CELL_H, linestyles='--', colors='blue')
+fig_4.tight_layout()
+ax_4.axis('off')
+plt.title("Full-Chip Size: " + str(CELL_H*test_crop_array_shape[0]*14) + "x" + str(CELL_W*test_crop_array_shape[1]*14) + "nm^2")
+for i in np.arange(len(auto_selection_set)):
+    index = auto_selection_set[i]
+    position = cell_position_remain[index]
+    x = CELL_W*position[1] # rectangle左上角坐标
+    y = CELL_H*position[0] # rectangle左上角坐标
+    ax_4.add_patch(patches.Rectangle((x, y), CELL_W, CELL_H, linewidth=2, edgecolor='r', facecolor='none'))
+    ax_4.text(x+20, y+CELL_H/2, str(i), fontsize=5, bbox=dict(facecolor='red', alpha=0.5))
+fig_4.savefig("4-1 fullGDS+selectedCell_afterRemoveRepeat.png", dpi=300)
+
+# 生成autocell的坐标
+# demo格式： 
+
+[Cell window]
+Cellid	Cell_name	X1	Y1	X2	Y2	Weight	Anchor	GDS	Layer:datatype	TNPKey	Repeating	Isolated	Candidate	UserSelected	cep	cep_file	retarget	
+0,CW_0,1980.00000000,1880.00000000,2060.00000000,1960.00000000,1.00000000,0,/gpfs/PEG/SMO/vincchen/test/180302_UMC_L14_newron/GDSfile/crop_UMC_L14.gds,150:0,Quartz,0,0,1,0,0,,0,
+
+append_str = "1.00000000,0,/gpfs/PEG/SMO/vincchen/test/180302_UMC_L14_newron/GDSfile/crop_UMC_L14.gds,150:0,Quartz,0,0,1,0,0,,0,"
+auto_selection_set_coordinate = cell_coordinate_remain[auto_selection_set]
+with open("mask_setup.txt", 'w') as mask_f:
+    for i in range(len(auto_selection_set_coordinate)):
+        y0 = str(auto_selection_set_coordinate[i][0]) + ','
+        x0 = str(auto_selection_set_coordinate[i][1]) + ','
+        y1 = str(auto_selection_set_coordinate[i][0] - PIXEL_SIZE*CELL_H) + ','
+        x1 = str(auto_selection_set_coordinate[i][1] + PIXEL_SIZE*CELL_W) + ','
+        line = str(i+1) + ','  + "CW_" + str(i+1) + ',' + x0 + y0 + x1 + y1 + append_str + '\n'
+        mask_f.writelines(line)
+"""
